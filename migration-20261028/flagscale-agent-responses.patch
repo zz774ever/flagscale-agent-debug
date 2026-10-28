@@ -1,0 +1,826 @@
+diff --git a/README.md b/README.md
+index c029752..a59b9a4 100644
+--- a/README.md
++++ b/README.md
+@@ -68,6 +68,7 @@ provider: anthropic                        # anthropic | openai
+ model: claude-sonnet-4-20250514            # Model name
+ # api_key: sk-xxx                          # Optional: defaults to env var
+ # base_url: https://api.custom.com/v1      # Optional: custom endpoint
++# openai_api: auto                        # auto | chat_completions | responses
+ 
+ # Execution Limits
+ max_iterations: 200                        # Max iterations per turn
+@@ -78,6 +79,10 @@ max_output_tokens: 8192                    # Max tokens per response
+ # See examples/agent_config.yaml for full configuration options
+ ```
+ 
++For a model or gateway that requires Responses, use `--openai-api responses` or
++set `openai_api: responses` in the YAML config. The default `auto` switches to
++Responses when the server explicitly rejects the Chat Completions protocol.
++
+ ### Your First Command
+ 
+ ```bash
+diff --git a/README_zh.md b/README_zh.md
+index a88ca58..5086c08 100644
+--- a/README_zh.md
++++ b/README_zh.md
+@@ -71,6 +71,20 @@ max_output_tokens: 8192                    # 单次响应最大 token 数
+ # 完整配置选项参见 examples/agent_config.yaml
+ ```
+ 
++未显式传入的命令行选项会保留配置文件中的值。例如，`flagscale-agent --provider openai`
++会保留 OpenAI 配置中的模型、密钥和地址。切换到不同的提供商时，模型、密钥和地址会
++从新提供商的环境变量或默认值解析；可用 `--model` 和 `--base-url` 显式覆盖。
++
++若中转返回“模型不支持 Chat Completions”，可直接使用 Responses 协议：
++
++```bash
++flagscale-agent --provider openai --openai-api responses "只回复 OK"
++```
++
++也可在 `~/.flagscale/agent.yaml` 中添加 `openai_api: responses`。默认 `auto` 会在服务端明确
++拒绝 Chat Completions 协议时切换到 Responses，并在本次运行的后续请求中继续使用它。
++`openai_api: chat_completions` 可固定使用原协议。
++
+ ### 第一个命令
+ 
+ ```bash
+diff --git a/examples/agent_config.yaml b/examples/agent_config.yaml
+index 11711ef..8864d50 100644
+--- a/examples/agent_config.yaml
++++ b/examples/agent_config.yaml
+@@ -20,6 +20,7 @@ provider: anthropic                        # anthropic | openai
+ model: claude-sonnet-4-20250514            # Model name
+ # api_key: sk-xxx                          # Optional: API key (defaults to env var)
+ # base_url: https://api.custom.com/v1      # Optional: Custom API endpoint
++# openai_api: auto                        # auto | chat_completions | responses
+ 
+ # ── Execution Limits ──
+ max_iterations: 200                        # Max iterations per turn (thinking → tool → observation loop)
+diff --git a/flagscale_agent/cli.py b/flagscale_agent/cli.py
+index b8b9eb1..d371717 100644
+--- a/flagscale_agent/cli.py
++++ b/flagscale_agent/cli.py
+@@ -47,9 +47,10 @@ app = typer.Typer(
+ @app.callback(invoke_without_command=True)
+ def main(
+     ctx: typer.Context,
+-    provider: str = typer.Option("anthropic", "--provider", "-p", help="LLM provider (anthropic, openai)"),
++    provider: str | None = typer.Option(None, "--provider", "-p", help="LLM provider (anthropic, openai; defaults to config or anthropic)"),
+     model: str | None = typer.Option(None, "--model", "-m", help="Model name (default: provider's default)"),
+     base_url: str | None = typer.Option(None, "--base-url", "-b", help="API base URL (for proxies/gateways)"),
++    openai_api: str | None = typer.Option(None, "--openai-api", help="OpenAI API protocol: auto, chat_completions, or responses"),
+     config: Path | None = typer.Option(None, "--config", "-c", help="Agent config YAML path"),
+     auto_resume: str | None = typer.Option(None, "--auto-resume", help="Auto-resume session ID (internal use by /reload)"),
+     query: str | None = typer.Argument(None, help="Single-shot query (non-interactive mode)"),
+@@ -70,15 +71,9 @@ def main(
+     from flagscale_agent.react.config import AgentConfig
+     from flagscale_agent.react.agent import WorkerAgent
+     if config:
+-        cfg = AgentConfig.from_yaml(str(config))
+-        # Always apply CLI overrides
+-        cfg.provider = provider
+-        if model:
+-            cfg.model = model
+-        if base_url:
+-            cfg.base_url = base_url
++        cfg = AgentConfig.from_yaml(str(config), provider=provider, model=model, base_url=base_url, openai_api=openai_api)
+     else:
+-        cfg = AgentConfig.auto_load(provider=provider, model=model, base_url=base_url)
++        cfg = AgentConfig.auto_load(provider=provider, model=model, base_url=base_url, openai_api=openai_api)
+     if thinking_budget:
+         cfg.thinking_budget = thinking_budget
+     if max_output_tokens != 8192:
+diff --git a/flagscale_agent/react/agent.py b/flagscale_agent/react/agent.py
+index 6a5f2cc..c5ec382 100644
+--- a/flagscale_agent/react/agent.py
++++ b/flagscale_agent/react/agent.py
+@@ -170,6 +170,7 @@ class WorkerAgent:
+             config.provider, config.model, config.api_key,
+             config.base_url, config.max_output_tokens,
+             thinking_budget=config.thinking_budget,
++            openai_api=config.openai_api,
+         )
+ 
+         self.history = HistoryManager(max_context_tokens=config.max_context_tokens)
+@@ -1638,6 +1639,7 @@ class WorkerAgent:
+         sentinel_stripper = display.SentinelStripper()
+         thinking_text = ""
+         thinking_signature = ""
++        responses_reasoning = []
+ 
+         def compress_newlines(text, trailing_from_prev, is_first):
+             if not text:
+@@ -1753,6 +1755,10 @@ class WorkerAgent:
+                             display._write(display.dim("\n"))
+                     elif event["type"] == "signature":
+                         thinking_signature += event["content"]
++                    elif event["type"] == "response_reasoning":
++                        responses_reasoning.append(event["item"])
++                    elif event["type"] == "truncated":
++                        stream_truncated = True
+                     elif event["type"] == "usage":
+                         usage = {
+                             "input_tokens": event.get("input_tokens"),
+@@ -1829,7 +1835,7 @@ class WorkerAgent:
+             if not parsed_tool_calls:
+                 parsed_tool_calls = None
+ 
+-        return {"content": "".join(content_parts) or None, "tool_calls": parsed_tool_calls, "truncated": stream_truncated, "reasoning_only": reasoning_only, "thinking_capped": thinking_capped, "thinking": thinking_text or None, "signature": thinking_signature or None}, usage
++        return {"content": "".join(content_parts) or None, "tool_calls": parsed_tool_calls, "truncated": stream_truncated, "reasoning_only": reasoning_only, "thinking_capped": thinking_capped, "thinking": thinking_text or None, "signature": thinking_signature or None, "_responses_reasoning": responses_reasoning}, usage
+ 
+     # ── Tool execution (delegated to ToolExecutor) ──────────────────────────
+ 
+diff --git a/flagscale_agent/react/config.py b/flagscale_agent/react/config.py
+index 9e6033e..a006a54 100644
+--- a/flagscale_agent/react/config.py
++++ b/flagscale_agent/react/config.py
+@@ -77,6 +77,7 @@ class AgentConfig:
+     model: Optional[str] = None
+     api_key: Optional[str] = None
+     base_url: Optional[str] = None
++    openai_api: str = "auto"  # auto, chat_completions, or responses
+     max_iterations: int = 200000
+     max_context_tokens: int = 0  # 0 = auto-detect from model
+     shell_remind_interval: int = 60
+@@ -90,6 +91,8 @@ class AgentConfig:
+     _config_path: Optional[str] = field(default=None, repr=False)
+ 
+     def __post_init__(self):
++        if self.openai_api not in ("auto", "chat_completions", "responses"):
++            raise ValueError("openai_api must be auto, chat_completions, or responses")
+         if self.model is None:
+             if self.provider == "anthropic":
+                 env_model = os.environ.get("ANTHROPIC_MODEL")
+@@ -132,12 +135,20 @@ class AgentConfig:
+                     self.shell_env[var] = val
+ 
+     @classmethod
+-    def from_yaml(cls, path: str) -> "AgentConfig":
+-        """Load config from a YAML file. Unknown keys are ignored."""
++    def from_yaml(cls, path: str, **overrides) -> "AgentConfig":
++        """Load YAML and apply explicit overrides before resolving defaults."""
+         with open(path, "r", encoding="utf-8") as f:
+             data = yaml.safe_load(f) or {}
+         valid_fields = {f.name for f in cls.__dataclass_fields__.values() if not f.name.startswith("_")}
+         filtered = {k: v for k, v in data.items() if k in valid_fields}
++        provider = overrides.get("provider")
++        if provider is not None and provider != filtered.get("provider", "anthropic"):
++            for key in ("model", "api_key", "base_url", "openai_api"):
++                filtered.pop(key, None)
++        filtered.update({
++            key: value for key, value in overrides.items()
++            if key in valid_fields and value is not None
++        })
+         config = cls(**filtered)
+         config._config_path = path
+         return config
+@@ -153,43 +164,14 @@ class AgentConfig:
+                 config_path = candidate
+ 
+         if config_path and os.path.isfile(config_path):
+-            config = cls.from_yaml(config_path)
+-        else:
+-            config = cls()
+-            config._config_path = config_path
+-
+-        # Apply overrides
+-        for k, v in overrides.items():
+-            if v is not None and hasattr(config, k):
+-                setattr(config, k, v)
+-        
+-        # Re-run provider-dependent initialization if provider was overridden
+-        if "provider" in overrides and overrides["provider"] is not None:
+-            # Re-detect model, api_key, base_url based on the new provider
+-            if "model" not in overrides or overrides["model"] is None:
+-                if config.provider == "anthropic":
+-                    env_model = os.environ.get("ANTHROPIC_MODEL")
+-                elif config.provider == "openai":
+-                    env_model = os.environ.get("OPENAI_DEFAULT_MODEL")
+-                else:
+-                    env_model = None
+-                config.model = env_model or DEFAULT_MODELS.get(config.provider, "claude-sonnet-4-20250514")
+-            
+-            if "api_key" not in overrides or overrides["api_key"] is None:
+-                if config.provider == "anthropic":
+-                    config.api_key = (
+-                        os.environ.get("ANTHROPIC_AUTH_TOKEN")
+-                        or os.environ.get("ANTHROPIC_API_KEY")
+-                    )
+-                elif config.provider == "openai":
+-                    config.api_key = os.environ.get("OPENAI_API_KEY")
+-            
+-            if "base_url" not in overrides or overrides["base_url"] is None:
+-                if config.provider == "anthropic":
+-                    config.base_url = os.environ.get("ANTHROPIC_BASE_URL")
+-                elif config.provider == "openai":
+-                    config.base_url = os.environ.get("OPENAI_BASE_URL")
+-        
++            return cls.from_yaml(config_path, **overrides)
++
++        valid_fields = {f.name for f in cls.__dataclass_fields__.values() if not f.name.startswith("_")}
++        config = cls(**{
++            key: value for key, value in overrides.items()
++            if key in valid_fields and value is not None
++        })
++        config._config_path = config_path
+         return config
+ 
+     def reload(self):
+diff --git a/flagscale_agent/react/providers/__init__.py b/flagscale_agent/react/providers/__init__.py
+index f240148..c078e7a 100644
+--- a/flagscale_agent/react/providers/__init__.py
++++ b/flagscale_agent/react/providers/__init__.py
+@@ -17,12 +17,12 @@
+ from flagscale_agent.react.providers.base import LLMProvider
+ 
+ 
+-def get_provider(provider: str, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192, thinking_budget: int = 0) -> LLMProvider:
++def get_provider(provider: str, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192, thinking_budget: int = 0, openai_api: str = "auto") -> LLMProvider:
+     """Create an LLM provider instance."""
+     if provider == "openai":
+         from flagscale_agent.react.providers.openai_provider import OpenAIProvider
+ 
+-        return OpenAIProvider(model=model, api_key=api_key, base_url=base_url, max_tokens=max_tokens)
++        return OpenAIProvider(model=model, api_key=api_key, base_url=base_url, max_tokens=max_tokens, api_type=openai_api)
+     elif provider == "anthropic":
+         from flagscale_agent.react.providers.anthropic_provider import (
+             AnthropicProvider,
+diff --git a/flagscale_agent/react/providers/openai_provider.py b/flagscale_agent/react/providers/openai_provider.py
+index 098b727..ef36561 100644
+--- a/flagscale_agent/react/providers/openai_provider.py
++++ b/flagscale_agent/react/providers/openai_provider.py
+@@ -18,17 +18,20 @@ import json
+ 
+ from typing import Any, Dict, Iterator, List
+ 
+-from openai import OpenAI
++from openai import BadRequestError, OpenAI
+ 
+ from flagscale_agent.react.providers.base import LLMProvider
+ 
+ 
+ 
+ class OpenAIProvider(LLMProvider):
+-    def __init__(self, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192):
++    def __init__(self, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192, api_type: str = "auto"):
++        if api_type not in ("auto", "chat_completions", "responses"):
++            raise ValueError("openai_api must be auto, chat_completions, or responses")
+         self._model = model
+         self._max_tokens = max_tokens
+         self._base_url = base_url
++        self._api_type = api_type
+         kwargs = {"api_key": api_key, "timeout": 120.0}
+         if base_url:
+             kwargs["base_url"] = base_url
+@@ -38,7 +41,8 @@ class OpenAIProvider(LLMProvider):
+         """Build API call kwargs, with prompt caching support."""
+         kwargs = {
+             "model": self._model,
+-            "messages": messages,
++            "messages": [{k: v for k, v in message.items() if not k.startswith("_")}
++                         for message in messages],
+             "max_tokens": self._max_tokens,
+         }
+         if stream:
+@@ -48,11 +52,94 @@ class OpenAIProvider(LLMProvider):
+             kwargs["tools"] = tools
+         return kwargs
+ 
+-    def chat(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Dict[str, Any]:
+-        kwargs = self._build_kwargs(messages, tools)
++    def _build_responses_kwargs(self, messages, tools, stream=False):
++        """Translate the agent's history into stateless Responses input items."""
++        items = []
++        for message in messages:
++            role = message["role"]
++            if role == "tool":
++                items.append({"type": "function_call_output",
++                              "call_id": message["tool_call_id"],
++                              "output": message.get("content") or ""})
++                continue
++            items.extend(message.get("_responses_reasoning", []))
++            if message.get("content"):
++                items.append({"role": role, "content": message["content"]})
++            for call in message.get("tool_calls", []):
++                items.append({"type": "function_call", "call_id": call["id"],
++                              "name": call["function"]["name"],
++                              "arguments": call["function"]["arguments"]})
++        kwargs = {
++            "model": self._model,
++            "input": items,
++            "max_output_tokens": self._max_tokens,
++            "store": False,
++            "include": ["reasoning.encrypted_content"],
++        }
++        if stream:
++            kwargs["stream"] = True
++        if tools:
++            # Responses function definitions are flat; Chat Completions are nested.
++            kwargs["tools"] = [
++                {"type": "function", **tool["function"],
++                 "strict": tool["function"].get("strict", False)}
++                if tool.get("type") == "function" and "function" in tool else tool
++                for tool in tools
++            ]
++        return kwargs
+ 
++    def _create(self, messages, tools, stream=False):
++        if self._api_type != "responses":
++            try:
++                return self._client.chat.completions.create(
++                    **self._build_kwargs(messages, tools, stream=stream)
++                )
++            except BadRequestError as exc:
++                # Only a protocol rejection may select a different endpoint.
++                # Authentication, malformed tools, etc. must retain their errors.
++                error = str(exc).lower().replace("_", " ").replace("/", " ")
++                mentions_chat = "chat" in error and "completion" in error
++                unsupported = any(term in error for term in
++                                  ("not support", "doesn't support", "unsupported", "不支持", "only support"))
++                protocol_rejection = any(term in error for term in
++                                         ("model", "模型", "responses", "protocol", "协议", "endpoint"))
++                if self._api_type != "auto" or not (mentions_chat and unsupported and protocol_rejection):
++                    raise
++                self._api_type = "responses"
++        return self._client.responses.create(
++            **self._build_responses_kwargs(messages, tools, stream=stream)
++        )
++
++    @staticmethod
++    def _parse_responses(response):
++        if response.status == "failed" or response.error:
++            raise RuntimeError(f"Responses API failed: {response.error}")
++        content, tool_calls, reasoning = [], [], []
++        for item in response.output:
++            if item.type == "message":
++                for part in item.content:
++                    if part.type == "output_text":
++                        content.append(part.text)
++                    elif part.type == "refusal":
++                        content.append(part.refusal)
++            elif item.type == "function_call":
++                try:
++                    arguments = json.loads(item.arguments)
++                except (json.JSONDecodeError, TypeError):
++                    arguments = {}
++                tool_calls.append({"id": item.call_id, "name": item.name,
++                                   "arguments": arguments})
++            elif item.type == "reasoning":
++                reasoning.append(item.model_dump(exclude_none=True))
++        return {"content": "".join(content) or None, "tool_calls": tool_calls or None,
++                "_responses_reasoning": reasoning,
++                "truncated": response.status == "incomplete"}
++
++    def chat(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Dict[str, Any]:
+         try:
+-            response = self._client.chat.completions.create(**kwargs)
++            response = self._create(messages, tools)
++            if self._api_type == "responses":
++                return self._parse_responses(response)
+         except Exception as e:
+             return {"content": f"[PROVIDER_ERROR] {type(e).__name__}: {e}", "tool_calls": None}
+ 
+@@ -72,9 +159,10 @@ class OpenAIProvider(LLMProvider):
+         return {"content": message.content, "tool_calls": tool_calls}
+ 
+     def chat_stream(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Iterator[Dict[str, Any]]:
+-        kwargs = self._build_kwargs(messages, tools, stream=True)
+-
+-        stream = self._client.chat.completions.create(**kwargs)
++        stream = self._create(messages, tools, stream=True)
++        if self._api_type == "responses":
++            yield from self._responses_stream(stream)
++            return
+         seen_tool_ids = set()
+         had_reasoning = False
+         for chunk in stream:
+@@ -127,8 +215,82 @@ class OpenAIProvider(LLMProvider):
+             yield {"type": "reasoning_only"}
+         yield {"type": "done"}
+ 
++    def _responses_stream(self, stream):
++        calls = {}
++        reasoning_ids = set()
++        had_reasoning = False
++        finished = False
++        try:
++            for event in stream:
++                kind = event.type
++                if kind in ("response.output_text.delta", "response.refusal.delta"):
++                    yield {"type": "text", "content": event.delta}
++                elif kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
++                    had_reasoning = True
++                    yield {"type": "thinking", "content": event.delta}
++                elif kind == "response.output_item.added" and event.item.type == "function_call":
++                    item = event.item
++                    calls[item.id] = {"id": item.call_id, "arguments": item.arguments or ""}
++                    yield {"type": "tool_start", "id": item.call_id, "name": item.name}
++                    if item.arguments:
++                        yield {"type": "tool_delta", "id": item.call_id,
++                               "arguments_delta": item.arguments}
++                elif kind == "response.function_call_arguments.delta":
++                    call = calls[event.item_id]
++                    call["arguments"] += event.delta
++                    yield {"type": "tool_delta", "id": call["id"],
++                           "arguments_delta": event.delta}
++                elif kind == "response.output_item.done":
++                    item = event.item
++                    if item.type == "reasoning":
++                        reasoning_ids.add(item.id)
++                        yield {"type": "response_reasoning", "item": item.model_dump(exclude_none=True)}
++                    elif item.type == "function_call" and item.id not in calls:
++                        calls[item.id] = {"id": item.call_id, "arguments": item.arguments}
++                        yield {"type": "tool_start", "id": item.call_id, "name": item.name}
++                        yield {"type": "tool_delta", "id": item.call_id, "arguments_delta": item.arguments}
++                    elif item.type == "function_call":
++                        call = calls[item.id]
++                        # Some gateways only supply the full arguments at item.done.
++                        if item.arguments.startswith(call["arguments"]):
++                            remainder = item.arguments[len(call["arguments"]):]
++                            if remainder:
++                                yield {"type": "tool_delta", "id": call["id"],
++                                       "arguments_delta": remainder}
++                            call["arguments"] = item.arguments
++                elif kind in ("response.completed", "response.incomplete"):
++                    finished = True
++                    response = event.response
++                    for item in response.output:
++                        if item.type == "reasoning" and item.id not in reasoning_ids:
++                            reasoning_ids.add(item.id)
++                            yield {"type": "response_reasoning", "item": item.model_dump(exclude_none=True)}
++                    usage = response.usage
++                    if usage:
++                        data = {"type": "usage", "input_tokens": usage.input_tokens,
++                                "output_tokens": usage.output_tokens}
++                        details = usage.input_tokens_details
++                        if details and details.cached_tokens:
++                            data["cache_read_input_tokens"] = details.cached_tokens
++                        yield data
++                    if kind == "response.incomplete":
++                        yield {"type": "truncated"}
++                elif kind == "response.failed":
++                    raise RuntimeError(f"Responses API failed: {event.response.error}")
++                elif kind == "error":
++                    raise RuntimeError(f"Responses API error: {event.message}")
++            if not finished:
++                raise RuntimeError("Responses stream ended without a completion event")
++            if had_reasoning:
++                yield {"type": "reasoning_only"}
++            yield {"type": "done"}
++        finally:
++            stream.close()
++
+     def format_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:
+         msg = {"role": "assistant"}
++        if response.get("_responses_reasoning"):
++            msg["_responses_reasoning"] = response["_responses_reasoning"]
+         if response.get("thinking"):
+             msg["thinking"] = response["thinking"]
+         if response["content"]:
+diff --git a/pyproject.toml b/pyproject.toml
+index dc19e88..7fcd38f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -26,7 +26,7 @@ requires-python = ">=3.9"
+ dependencies = [
+     "typer>=0.9.0",
+     "anthropic>=0.39.0",
+-    "openai>=1.0.0",
++    "openai>=1.66.0",
+     "pyyaml>=6.0",
+     "prompt_toolkit>=3.0",
+     "requests>=2.28.0",
+diff --git a/tests/test_config_provider_override.py b/tests/test_config_provider_override.py
+index eeb19b9..06b357d 100644
+--- a/tests/test_config_provider_override.py
++++ b/tests/test_config_provider_override.py
+@@ -68,3 +68,85 @@ def test_provider_override_without_api_key(monkeypatch, tmp_path):
+     cfg = AgentConfig.auto_load(provider="openai")
+     assert cfg.provider == "openai"
+     assert cfg.api_key is None
++
++
++@pytest.fixture
++def openai_config(monkeypatch, tmp_path):
++    path = tmp_path / "agent.yaml"
++    path.write_text(
++        "provider: openai\nmodel: gpt-4o-mini\napi_key: yaml-key\n"
++        "base_url: https://relay.example.com/v1\nmax_iterations: 7\n"
++    )
++    monkeypatch.setenv("FLAGSCALE_AGENT_CONFIG", str(path))
++    monkeypatch.setenv("FLAGSCALE_HOME", str(tmp_path))
++    monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
++    monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example.com/v1")
++    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", "gpt-4o")
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-anthropic-key")
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://anthropic.example.com")
++    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-test")
++    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
++    return path
++
++
++@pytest.mark.parametrize("provider", [None, "openai"])
++def test_yaml_values_survive_same_provider_override(openai_config, provider):
++    config = AgentConfig.auto_load(provider=provider, model=None, base_url=None)
++    assert config.provider == "openai"
++    assert config.model == "gpt-4o-mini"
++    assert config.api_key == "yaml-key"
++    assert config.base_url == "https://relay.example.com/v1"
++    assert config.max_iterations == 7
++    assert config.max_context_tokens == 128000
++
++
++@pytest.mark.parametrize("explicit_context", [0, 32000])
++def test_model_override_resolves_context_after_merge(openai_config, explicit_context):
++    config = AgentConfig.auto_load(model="gpt-4", max_context_tokens=explicit_context)
++    assert config.model == "gpt-4"
++    assert config.api_key == "yaml-key"
++    assert config.max_context_tokens == (explicit_context or 8192)
++
++
++def test_switching_provider_resolves_new_credentials(openai_config):
++    config = AgentConfig.auto_load(provider="anthropic")
++    assert config.provider == "anthropic"
++    assert config.model == "claude-test"
++    assert config.api_key == "env-anthropic-key"
++    assert config.base_url == "https://anthropic.example.com"
++    assert config.max_iterations == 7
++
++
++def test_explicit_overrides_survive_provider_switch(openai_config):
++    config = AgentConfig.from_yaml(
++        str(openai_config), provider="anthropic", model="claude-explicit",
++        api_key="explicit-key", base_url="https://explicit.example.com",
++    )
++    assert config.provider == "anthropic"
++    assert config.model == "claude-explicit"
++    assert config.api_key == "explicit-key"
++    assert config.base_url == "https://explicit.example.com"
++
++
++@pytest.mark.parametrize("explicit_path", [False, True])
++@pytest.mark.parametrize("provider_args", [[], ["--provider", "openai"]])
++def test_cli_preserves_yaml_config(openai_config, monkeypatch, explicit_path, provider_args):
++    import sys
++    from types import SimpleNamespace
++    from unittest.mock import MagicMock
++
++    from typer.testing import CliRunner
++
++    from flagscale_agent.cli import app
++
++    worker = MagicMock()
++    monkeypatch.setitem(sys.modules, "flagscale_agent.react.agent", SimpleNamespace(WorkerAgent=worker))
++    args = ["--config", str(openai_config)] if explicit_path else []
++    result = CliRunner().invoke(app, args + provider_args + ["hello"])
++    assert result.exit_code == 0, result.output
++    config = worker.call_args.args[0]
++    assert config.provider == "openai"
++    assert config.model == "gpt-4o-mini"
++    assert config.api_key == "yaml-key"
++    assert config.base_url == "https://relay.example.com/v1"
++    worker.return_value.run.assert_called_once_with(single_shot_query="hello")
+diff --git a/tests/test_openai_responses.py b/tests/test_openai_responses.py
+new file mode 100644
+index 0000000..175dff8
+--- /dev/null
++++ b/tests/test_openai_responses.py
+@@ -0,0 +1,236 @@
++"""Exercise protocol selection and tool round trips through the real OpenAI SDK."""
++
++import json
++from types import SimpleNamespace
++
++import httpx
++import pytest
++from openai import BadRequestError, OpenAI
++from typer.testing import CliRunner
++
++from flagscale_agent.cli import app
++from flagscale_agent.react.agent import WorkerAgent
++from flagscale_agent.react.config import AgentConfig
++from flagscale_agent.react.history import HistoryManager
++from flagscale_agent.react.providers import get_provider
++from flagscale_agent.react.providers.openai_provider import OpenAIProvider
++
++
++TOOLS = [{"type": "function", "function": {
++    "name": "shell", "description": "Run a command",
++    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
++}}]
++REASONING = {"type": "reasoning", "id": "rs_1", "summary": [],
++             "encrypted_content": "opaque-reasoning"}
++CALL = {"type": "function_call", "id": "fc_1", "call_id": "call_1",
++        "name": "shell", "arguments": '{"command":"nvidia-smi"}'}
++
++
++def response(output=None, status="completed"):
++    return {"id": "resp_1", "object": "response", "created_at": 1,
++            "model": "test-model", "status": status, "error": None,
++            "output": output or [], "usage": {
++                "input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
++                "input_tokens_details": {"cached_tokens": 40},
++                "output_tokens_details": {"reasoning_tokens": 5},
++            }}
++
++
++def sse(events):
++    return httpx.Response(200, headers={"content-type": "text/event-stream"},
++                          content="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n"
++                                          for e in events))
++
++
++@pytest.fixture
++def make_provider():
++    clients = []
++
++    def make(handler, api_type="auto"):
++        provider = OpenAIProvider("test-model", "test-key", api_type=api_type)
++        provider._client.close()
++        provider._client = OpenAI(api_key="test-key", base_url="https://relay.example/v1",
++                                  max_retries=0,
++                                  http_client=httpx.Client(transport=httpx.MockTransport(handler)))
++        clients.append(provider._client)
++        return provider
++
++    yield make
++    for client in clients:
++        client.close()
++
++
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("message", [
++    "This model does not support chat completions; use responses",
++    "模型不支持 chat completions 协议",
++])
++def test_auto_switches_endpoint_and_keeps_selected_protocol(make_provider, stream, message):
++    requests = []
++
++    def handler(req):
++        data = json.loads(req.content)
++        requests.append((req.url.path, data))
++        if req.url.path.endswith("chat/completions"):
++            assert data["tools"] == TOOLS
++            return httpx.Response(400, json={"error": {"message": message}})
++        assert req.url.path == "/v1/responses"
++        assert data["tools"][0]["name"] == "shell"
++        assert data["tools"][0]["strict"] is False
++        assert "function" not in data["tools"][0]
++        assert data["input"] == [{"role": "user", "content": "Hi"}]
++        assert data["max_output_tokens"] == 8192
++        assert not {"messages", "max_tokens", "stream_options"} & data.keys()
++        if stream:
++            return sse([{"type": "response.output_text.delta", "delta": "OK"},
++                        {"type": "response.completed", "response": response()}])
++        return httpx.Response(200, json=response([{
++            "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
++            "content": [{"type": "output_text", "text": "OK", "annotations": []}],
++        }]))
++
++    provider = make_provider(handler)
++    for _ in range(2):
++        messages = [{"role": "user", "content": "Hi"}]
++        if stream:
++            events = list(provider.chat_stream(messages, TOOLS))
++            assert events[0] == {"type": "text", "content": "OK"}
++            assert events[-1] == {"type": "done"}
++        else:
++            assert provider.chat(messages, TOOLS)["content"] == "OK"
++    assert [path for path, _ in requests] == [
++        "/v1/chat/completions", "/v1/responses", "/v1/responses"]
++
++
++@pytest.mark.parametrize("api_type,message", [
++    ("auto", "Invalid tool schema"),
++    ("auto", "Unsupported tools in chat completions"),
++    ("chat_completions", "This model does not support chat completions"),
++])
++def test_other_400s_and_explicit_chat_do_not_fallback(make_provider, api_type, message):
++    paths = []
++
++    def handler(req):
++        paths.append(req.url.path)
++        return httpx.Response(400, json={"error": {"message": message}})
++
++    with pytest.raises(BadRequestError):
++        list(make_provider(handler, api_type).chat_stream([], []))
++    assert paths == ["/v1/chat/completions"]
++
++
++@pytest.mark.parametrize("send_deltas", [False, True])
++def test_parallel_calls_and_final_arguments_are_associated_with_call_ids(make_provider, send_deltas):
++    calls = [CALL, {**CALL, "id": "fc_2", "call_id": "call_2", "arguments": '{"command":"pwd"}'}]
++    events = [{"type": "response.output_item.added", "output_index": i,
++               "item": {**call, "arguments": ""}} for i, call in enumerate(calls)]
++    if send_deltas:
++        events.extend({"type": "response.function_call_arguments.delta", "item_id": call["id"],
++                       "output_index": i, "delta": call["arguments"]}
++                      for i, call in reversed(list(enumerate(calls))))
++    events.extend({"type": "response.output_item.done", "output_index": i, "item": call}
++                  for i, call in enumerate(calls))
++    events.append({"type": "response.completed", "response": response(calls)})
++    agent = WorkerAgent.__new__(WorkerAgent)
++    agent.config = SimpleNamespace(thinking_budget=0)
++    agent.provider = make_provider(lambda req: sse(events), "responses")
++    result, _ = agent._call_llm_stream([], TOOLS)
++    assert result["tool_calls"] == [
++        {"id": call["call_id"], "name": call["name"], "arguments": json.loads(call["arguments"])}
++        for call in calls]
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_tool_round_trip_preserves_call_id_reasoning_and_usage(make_provider, stream):
++    requests = []
++
++    def handler(req):
++        data = json.loads(req.content)
++        requests.append(data)
++        assert req.url.path == "/v1/responses"
++        if len(requests) == 2:
++            assert data["input"][2] == REASONING
++            function_call = data["input"][3]
++            assert {k: function_call[k] for k in ("type", "call_id", "name")} == {
++                k: CALL[k] for k in ("type", "call_id", "name")}
++            assert json.loads(function_call["arguments"]) == json.loads(CALL["arguments"])
++            assert data["input"][4] == {"type": "function_call_output",
++                                        "call_id": "call_1", "output": "GPU ready"}
++        if not stream:
++            return httpx.Response(200, json=response([REASONING, CALL]))
++        return sse([
++            {"type": "response.output_item.added", "output_index": 1,
++             "item": {**CALL, "arguments": ""}},
++            {"type": "response.function_call_arguments.delta", "item_id": "fc_1",
++             "output_index": 1, "delta": '{"command":'},
++            {"type": "response.function_call_arguments.delta", "item_id": "fc_1",
++             "output_index": 1, "delta": '"nvidia-smi"}'},
++            {"type": "response.output_item.done", "output_index": 0, "item": REASONING},
++            {"type": "response.output_item.done", "output_index": 1, "item": CALL},
++            {"type": "response.completed", "response": response([REASONING, CALL])},
++        ])
++
++    provider = make_provider(handler, "responses")
++    history = HistoryManager()
++    history.set_system_prompt("You are an assistant.")
++    history.append({"role": "user", "content": "Check GPU"})
++    agent = WorkerAgent.__new__(WorkerAgent)
++    agent.config = SimpleNamespace(thinking_budget=0)
++    agent.provider = provider
++    if stream:
++        result, usage = agent._call_llm_stream(history.get_messages(), TOOLS)
++        assert usage["input_tokens"] == 100
++        assert usage["cache_read_input_tokens"] == 40
++    else:
++        result = provider.chat(history.get_messages(), TOOLS)
++    assert result["tool_calls"] == [{"id": "call_1", "name": "shell",
++                                     "arguments": {"command": "nvidia-smi"}}]
++    assert result["_responses_reasoning"] == [REASONING]
++    history.append(provider.format_assistant_message(result))
++    history.append(provider.format_tool_result("call_1", "GPU ready"))
++    if stream:
++        agent._call_llm_stream(history.get_messages(), TOOLS)
++    else:
++        provider.chat(history.get_messages(), TOOLS)
++    assert len(requests) == 2
++
++
++@pytest.mark.parametrize("kind", ["response.failed", "error", "disconnect", "response.incomplete"])
++def test_stream_failures_are_not_silently_reported_as_success(make_provider, kind):
++    events = []
++    if kind == "error":
++        events = [{"type": kind, "message": "upstream rejected request"}]
++    elif kind != "disconnect":
++        events = [{"type": kind, "response": response(status=kind.split(".")[1])}]
++    provider = make_provider(lambda req: sse(events), "responses")
++    if kind == "response.incomplete":
++        agent = WorkerAgent.__new__(WorkerAgent)
++        agent.config = SimpleNamespace(thinking_budget=0)
++        agent.provider = provider
++        result, _ = agent._call_llm_stream([], [])
++        assert result["truncated"] is True
++    else:
++        with pytest.raises(RuntimeError):
++            list(provider.chat_stream([], []))
++
++
++def test_cli_yaml_and_factory_select_responses(tmp_path, monkeypatch):
++    import sys
++    from unittest.mock import MagicMock
++
++    path = tmp_path / "agent.yaml"
++    path.write_text("provider: openai\nmodel: test-model\napi_key: test-key\nopenai_api: responses\n")
++    monkeypatch.setenv("FLAGSCALE_HOME", str(tmp_path))
++    worker = MagicMock()
++    monkeypatch.setitem(sys.modules, "flagscale_agent.react.agent", SimpleNamespace(WorkerAgent=worker))
++    result = CliRunner().invoke(app, ["--config", str(path), "hello"])
++    assert result.exit_code == 0, result.output
++    assert worker.call_args.args[0].openai_api == "responses"
++    result = CliRunner().invoke(app, ["--config", str(path), "--openai-api", "chat_completions", "hello"])
++    assert result.exit_code == 0, result.output
++    assert worker.call_args.args[0].openai_api == "chat_completions"
++    provider = get_provider("openai", "test", "key", openai_api="responses")
++    assert provider._api_type == "responses"
++    provider._client.close()
++    with pytest.raises(ValueError, match="openai_api"):
++        AgentConfig(openai_api="invalid")

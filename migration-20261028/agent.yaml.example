@@ -1,0 +1,12 @@
+# Copy to ~/.flagscale/agent.yaml and replace api_key before starting.
+provider: openai
+model: gpt-6.1-sol
+api_key: "REPLACE_WITH_YOUR_API_KEY"
+base_url: https://api.codexzh.com/v1
+openai_api: responses
+
+max_iterations: 200
+max_continuations: 200
+max_context_tokens: 0
+max_output_tokens: 8192
+thinking_budget: 0

@@ -248,7 +248,7 @@ index f240148..c078e7a 100644
          from flagscale_agent.react.providers.anthropic_provider import (
              AnthropicProvider,
 diff --git a/flagscale_agent/react/providers/openai_provider.py b/flagscale_agent/react/providers/openai_provider.py
-index 098b727..ef36561 100644
+index 098b727..8e5dd87 100644
 --- a/flagscale_agent/react/providers/openai_provider.py
 +++ b/flagscale_agent/react/providers/openai_provider.py
 @@ -18,17 +18,20 @@ import json
@@ -284,7 +284,7 @@ index 098b727..ef36561 100644
              "max_tokens": self._max_tokens,
          }
          if stream:
-@@ -48,11 +52,94 @@ class OpenAIProvider(LLMProvider):
+@@ -48,11 +52,103 @@ class OpenAIProvider(LLMProvider):
              kwargs["tools"] = tools
          return kwargs
  
@@ -301,8 +301,17 @@ index 098b727..ef36561 100644
 +                              "output": message.get("content") or ""})
 +                continue
 +            items.extend(message.get("_responses_reasoning", []))
-+            if message.get("content"):
-+                items.append({"role": role, "content": message["content"]})
++            content = message.get("content")
++            if content:
++                if isinstance(content, list):
++                    # History merges user/guard messages into legacy text blocks.
++                    # Convert at the API boundary without modifying stored history.
++                    content = [
++                        {**block, "type": "input_text"}
++                        if isinstance(block, dict) and block.get("type") == "text" else block
++                        for block in content
++                    ]
++                items.append({"role": role, "content": content})
 +            for call in message.get("tool_calls", []):
 +                items.append({"type": "function_call", "call_id": call["id"],
 +                              "name": call["function"]["name"],
@@ -382,7 +391,7 @@ index 098b727..ef36561 100644
          except Exception as e:
              return {"content": f"[PROVIDER_ERROR] {type(e).__name__}: {e}", "tool_calls": None}
  
-@@ -72,9 +159,10 @@ class OpenAIProvider(LLMProvider):
+@@ -72,9 +168,10 @@ class OpenAIProvider(LLMProvider):
          return {"content": message.content, "tool_calls": tool_calls}
  
      def chat_stream(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Iterator[Dict[str, Any]]:
@@ -396,7 +405,7 @@ index 098b727..ef36561 100644
          seen_tool_ids = set()
          had_reasoning = False
          for chunk in stream:
-@@ -127,8 +215,82 @@ class OpenAIProvider(LLMProvider):
+@@ -127,8 +224,82 @@ class OpenAIProvider(LLMProvider):
              yield {"type": "reasoning_only"}
          yield {"type": "done"}
  
@@ -584,13 +593,14 @@ index eeb19b9..06b357d 100644
 +    worker.return_value.run.assert_called_once_with(single_shot_query="hello")
 diff --git a/tests/test_openai_responses.py b/tests/test_openai_responses.py
 new file mode 100644
-index 0000000..175dff8
+index 0000000..25ff8da
 --- /dev/null
 +++ b/tests/test_openai_responses.py
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,286 @@
 +"""Exercise protocol selection and tool round trips through the real OpenAI SDK."""
 +
 +import json
++from copy import deepcopy
 +from types import SimpleNamespace
 +
 +import httpx
@@ -690,6 +700,55 @@ index 0000000..175dff8
 +            assert provider.chat(messages, TOOLS)["content"] == "OK"
 +    assert [path for path, _ in requests] == [
 +        "/v1/chat/completions", "/v1/responses", "/v1/responses"]
++
++
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("api_type", ["responses", "auto"])
++def test_merged_user_and_guard_messages_use_responses_text_blocks(make_provider, stream, api_type):
++    requests = []
++
++    def handler(req):
++        requests.append(req.url.path)
++        if req.url.path.endswith("chat/completions"):
++            return httpx.Response(400, json={"error": {
++                "message": "This model does not support chat completions; use responses"}})
++        assert req.url.path == "/v1/responses"
++        assert json.loads(req.content)["input"] == [{"role": "user", "content": [
++            {"type": "input_text", "text": "Check GPU"},
++            {"type": "input_text", "text": "[GUARD ADVISORY] Inspect the environment first"},
++        ]}]
++        if stream:
++            return sse([{"type": "response.completed", "response": response()}])
++        return httpx.Response(200, json=response())
++
++    history = HistoryManager()
++    history.append({"role": "user", "content": "Check GPU"})
++    history.append({"role": "user", "content": "[GUARD ADVISORY] Inspect the environment first"})
++    messages = history.get_messages()
++    original = deepcopy(messages)
++    assert all(block["type"] == "text" for block in messages[0]["content"])
++    provider = make_provider(handler, api_type)
++    if stream:
++        assert list(provider.chat_stream(messages, []))[-1] == {"type": "done"}
++    else:
++        assert provider.chat(messages, [])["content"] is None
++    assert messages == original
++    assert requests == (["/v1/chat/completions"] if api_type == "auto" else []) + ["/v1/responses"]
++
++
++def test_responses_preserves_existing_typed_blocks_and_source_history(make_provider):
++    provider = make_provider(lambda req: httpx.Response(200, json=response()), "responses")
++    blocks = [
++        {"type": "text", "text": "Legacy text"},
++        {"type": "input_text", "text": "Already converted"},
++        {"type": "input_image", "image_url": "https://example.test/image.png", "detail": "auto"},
++    ]
++    messages = [{"role": "user", "content": blocks}]
++    original = deepcopy(messages)
++    assert provider._build_responses_kwargs(messages, [])["input"][0]["content"] == [
++        {"type": "input_text", "text": "Legacy text"}, *blocks[1:]]
++    assert messages == original
++    assert provider._build_kwargs(messages, [])["messages"][0]["content"] == blocks
 +
 +
 +@pytest.mark.parametrize("api_type,message", [

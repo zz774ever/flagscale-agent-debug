@@ -138,6 +138,7 @@ flagscale-agent --config ~/.flagscale/agent.yaml --provider openai --openai-api=
 
 - `/responses` 请求，以及 `input`、`max_output_tokens` 等请求字段。
 - Responses 工具定义、函数调用和工具结果的转换。
+- 连续用户消息和 Guard 提示合并后，将旧 `text` 文本块转换为 `input_text`，保留原始历史和其他内容块。
 - 普通响应和流式事件解析，包括多个工具的参数归属。
 - 多轮请求所需的调用 ID 和推理状态保存。
 - 流错误、未完成响应和连接中断的处理。
@@ -177,7 +178,7 @@ flagscale-agent --config ~/.flagscale/agent.yaml --provider openai --openai-api=
 
 ## 验证记录
 
-完整补丁已在基准提交的原始源码上重新应用，重建后的 349 个文件与保存的源码副本一致。重建源码上的相关回归测试结果为 **121 passed**，覆盖配置加载、协议切换、请求格式、流式响应、并行工具参数、多轮工具交互及错误处理。
+完整补丁已在基准提交的原始源码上重新应用，重建后的 349 个文件与保存的源码副本一致。重建源码上的相关回归测试结果为 **126 passed**，覆盖配置加载、协议切换、请求格式、流式响应、并行工具参数、多轮工具交互及错误处理。
 
 需要重跑这些测试时，进入解压后的源码目录执行：
 
@@ -186,7 +187,7 @@ pip install -e '.[dev]'
 pytest -q tests/test_openai_responses.py tests/test_providers.py tests/test_config.py tests/test_config_provider_override.py tests/test_thinking_cap.py tests/test_empty_retry_thinking_fix.py
 ```
 
-此前完整测试为 `1903 passed, 1 failed`，唯一失败是 `/tmp` 存储类型识别测试。该结果产生于最后的小幅请求过滤调整和新增三个针对性测试之前；最终版本重新通过了上述 121 项相关测试。
+此前完整测试为 `1903 passed, 1 failed`，唯一失败是 `/tmp` 存储类型识别测试。该结果来自较早快照；本次文本块转换修复后，重新通过了上述 126 项相关测试，其中新增的 5 项覆盖合并消息的协议转换和历史保留。
 
 自动测试使用模拟 HTTP 与真实 OpenAI SDK；此次部署的真实中转已由使用者反馈可用。新服务器仍需要有效密钥、模型权限和可访问的服务地址。
 

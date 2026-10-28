@@ -51,7 +51,7 @@ flagscale-agent --help
 
 ### 3. 创建配置文件
 
-以下步骤使用默认配置目录 `~/.flagscale`：
+先创建默认配置目录 `~/.flagscale`。注意：`mkdir` 只创建目录，不会创建 `agent.yaml`：
 
 ```bash
 unset FLAGSCALE_AGENT_CONFIG
@@ -59,18 +59,18 @@ unset FLAGSCALE_HOME
 mkdir -p ~/.flagscale
 ```
 
-如果已经有配置文件，先备份，再复制模板：
+然后创建并打开 `~/.flagscale/agent.yaml`。如果文件已经存在，先备份：
 
 ```bash
 if [ -f ~/.flagscale/agent.yaml ]; then
     cp -p ~/.flagscale/agent.yaml ~/.flagscale/agent.yaml.before-responses
 fi
-cp ~/flagscale-agent-migration/agent.yaml.example ~/.flagscale/agent.yaml
+touch ~/.flagscale/agent.yaml
 chmod 600 ~/.flagscale/agent.yaml
 nano ~/.flagscale/agent.yaml
 ```
 
-将模板中的 `REPLACE_WITH_YOUR_API_KEY` 替换为自己的真实密钥。完整配置示例：
+在编辑器中将文件内容设置为下面的配置，并把 `替换为你的真实密钥` 换成自己的真实密钥：
 
 ```yaml
 provider: openai
